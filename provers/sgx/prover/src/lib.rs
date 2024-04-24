@@ -4,12 +4,13 @@ use std::{
     fs::{copy, create_dir_all, remove_file},
     path::PathBuf,
     process::{Command as StdCommand, Output, Stdio},
-    str,
+    str::{self, FromStr},
 };
 
 use alloy_sol_types::SolValue;
 use once_cell::sync::Lazy;
 use raiko_lib::{
+    consts::{get_network_spec, Network},
     input::{GuestInput, GuestOutput},
     protocol_instance::ProtocolInstance,
     prover::{to_proof, Proof, Prover, ProverConfig, ProverError, ProverResult},
@@ -19,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::serde_as;
 use tokio::{process::Command, sync::OnceCell};
+
+use crate::sgx_register_utils::register_sgx_instance;
 
 // to register the instance id
 mod sgx_register_utils;
@@ -58,7 +61,7 @@ impl Prover for SgxProver {
         _output: GuestOutput,
         config: &ProverConfig,
     ) -> ProverResult<Proof> {
-        let config = SgxParam::deserialize(config.get("sgx").unwrap()).unwrap();
+        let sgx_param = SgxParam::deserialize(config.get("sgx").unwrap()).unwrap();
 
         // Support both SGX and the direct backend for testing
         let direct_mode = match env::var("SGX_DIRECT") {
@@ -108,20 +111,39 @@ impl Prover for SgxProver {
         };
 
         // Setup: run this once while setting up your SGX instance
-        if config.setup {
+        if sgx_param.setup {
             setup(&cur_dir, direct_mode).await?;
         }
 
-        let mut sgx_proof = if config.bootstrap {
-            bootstrap(cur_dir.clone(), gramine_cmd()).await
+        let mut sgx_proof = if sgx_param.bootstrap {
+            let bootstrap_proof = bootstrap(cur_dir.clone(), gramine_cmd()).await?;
+
+            // #[cfg(feature = "k8s-all-in-one")]
+            {
+                let l1_network: Network =
+                    Network::from_str(config.get("network").unwrap().as_str().unwrap()).unwrap();
+                let l2_network: Network =
+                    Network::from_str(config.get("l1_network").unwrap().as_str().unwrap()).unwrap();
+                let register_res = register_sgx_instance(
+                    &bootstrap_proof.quote,
+                    config.get("l1_rpc").unwrap().as_str().unwrap(),
+                    get_network_spec(l1_network).chain_id,
+                    get_network_spec(l2_network).sgx_verifier_address.unwrap(),
+                )
+                .await;
+                if let Err(e) = register_res {
+                    return Err(ProverError::GuestError(e.to_string()));
+                }
+            }
+            Ok(bootstrap_proof)
         } else {
             // Dummy proof: it's ok when only setup/bootstrap was requested
             Ok(SgxResponse::default())
         };
 
-        if config.prove {
+        if sgx_param.prove {
             // overwirte sgx_proof as the bootstrap quote stays the same in bootstrap & prove.
-            sgx_proof = prove(gramine_cmd(), input.clone(), config.instance_id).await
+            sgx_proof = prove(gramine_cmd(), input.clone(), sgx_param.instance_id).await
         }
 
         to_proof(sgx_proof)
